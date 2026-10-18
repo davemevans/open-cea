@@ -30,6 +30,10 @@ Released under Apache 2.0.
   lists, sample CLI and library usage.
 - `specs/608.md` - comprehensive digest of CTA-608-E S-2019.
 - `specs/708.md` - comprehensive digest of CTA-708-E S-2023 + errata.
+- `specs/334-2.md` - digest of SMPTE ST 334-2:2015, the Caption
+  Distribution Packet (CDP) each MCC line carries.
+- `specs/334-1.md` - digest of SMPTE ST 334-1:2015, the ANC packet
+  (DID 0x61 / SDID 0x01) that wraps the CDP.
 - `specs/mccdec.c` - ffmpeg's MCC demuxer source; the closest thing
   to a spec for the MCC format the project consumes.
 - `specs/*.pdf` - the original standards are never committed to the
