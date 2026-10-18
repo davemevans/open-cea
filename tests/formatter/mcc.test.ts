@@ -129,6 +129,25 @@ describe('formatMcc - data lines', () => {
   });
 });
 
+describe('formatMcc - cc_data guard', () => {
+  it('rejects a frame that is not a whole number of 3-byte tuples', () => {
+    expect(() => formatMcc([new Uint8Array(3), new Uint8Array(4)], { fps: 30, ...FIXED_OPTIONS }))
+      .toThrow(/Frame 1: cc_data length 4 is not a whole number of 3-byte tuples/);
+  });
+
+  it('rejects more tuples than the 5-bit cc_count can carry', () => {
+    expect(() => formatMcc([new Uint8Array(32 * 3)], { fps: 30, ...FIXED_OPTIONS }))
+      .toThrow(/32 cc_data tuples exceed the 31/);
+  });
+
+  it('accepts the 31-tuple maximum, encoding cc_count 31', () => {
+    const out = formatMcc([new Uint8Array(31 * 3).fill(0xFA)], { fps: 30, ...FIXED_OPTIONS });
+    const hex = out.split('\n').find((l) => l.startsWith('00:00:00:00\t'))?.split('\t')[1] ?? '';
+    // [DID SDID DC | 96 69 len fr flags seq seq | 72 cc_count ...]
+    expect(hexToBytes(hex)[11]).toBe(0xE0 | 31);
+  });
+});
+
 describe('formatMcc - caption_service_active flag', () => {
   // cdp_flags is the 5th CDP byte: [DID SDID DC | 96 69 len fr FLAGS ...].
   const FLAGS = 7;

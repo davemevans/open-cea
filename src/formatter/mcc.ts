@@ -89,7 +89,7 @@ function wrapAncPacket(
   seq: number,
   serviceActive: boolean,
 ): Uint8Array {
-  const ccCount = ccData.length / 3; // 3 bytes per cc_data tuple
+  const ccCount = ccData.length / 3; // validated by formatMcc
   const frByte = (cdpFrameRateCode(fps) << 4) | 0x0F;
   const seqHi = (seq >> 8) & 0xFF;
   const seqLo = seq & 0xFF;
@@ -110,7 +110,7 @@ function wrapAncPacket(
   cdp[i++] = flags;                      // cdp_flags
   cdp[i++] = seqHi; cdp[i++] = seqLo;    // cdp_hdr_sequence_counter
   cdp[i++] = 0x72;                       // ccdata_id
-  cdp[i++] = 0xE0 | (ccCount & 0x1F);    // marker(111) + cc_count
+  cdp[i++] = 0xE0 | ccCount;             // marker(111) + cc_count
   cdp.set(ccData, i); i += ccData.length;
   cdp[i++] = 0x74;                       // cdp_footer_id
   cdp[i++] = seqHi; cdp[i++] = seqLo;    // cdp_ftr_sequence_counter
@@ -205,6 +205,20 @@ export function formatMcc(frames: Uint8Array[], options: MccOptions): string {
   const serviceActive = frames.some(frameHasDtvcc);
 
   for (let i = 0; i < frames.length; i++) {
+    // cc_count is a 5-bit field and must agree with cdp_length, so
+    // refuse anything that is not a whole number of tuples or does not
+    // fit, rather than emit a CDP whose count and length disagree.
+    const len = frames[i].length;
+    if (len % 3 !== 0) {
+      throw new RangeError(
+        `Frame ${String(i)}: cc_data length ${String(len)} is not a whole number of 3-byte tuples`,
+      );
+    }
+    if (len / 3 > 31) {
+      throw new RangeError(
+        `Frame ${String(i)}: ${String(len / 3)} cc_data tuples exceed the 31 a CDP cc_count can carry`,
+      );
+    }
     // Each frame's cc_data() is wrapped as a CDP inside a SMPTE 291M
     // ANC packet; the CDP sequence counter tracks the frame index.
     const anc = wrapAncPacket(frames[i], options.fps, i & 0xFFFF, serviceActive);
