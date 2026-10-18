@@ -116,7 +116,8 @@ src/
   formatter/raw.ts            Uint8Array -> binary file
   formatter/timecode.ts       SMPTE drop / non-drop timecode helper
   formatter/split.ts          flat byte stream -> per-frame slices
-  formatter/mcc.ts            MCC v2.0 sidecar formatter
+  formatter/mcc.ts            MCC v2.0 sidecar formatter; wraps each
+                              frame in a CDP + SMPTE 291M ANC packet
   cli/runCli.ts               commander-based CLI entry point
   index.ts                    package re-exports
 

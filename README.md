@@ -100,7 +100,9 @@ runtime dependency (`commander`).
 
 - **MCC v2.0** (default). MacCaption sidecar that FFmpeg natively
   demuxes into `cc_data()` payloads, ready to mux into SEI for any
-  modern video codec without feature loss.
+  modern video codec without feature loss. Each line carries the
+  frame's `cc_data()` in a SMPTE 334-2 Caption Distribution Packet
+  inside a SMPTE 291M ANC packet, as MCC requires.
 - **Raw**. Flat binary dump of `cc_data()` tuples, primarily for
   testing or piping into other parsers.
 

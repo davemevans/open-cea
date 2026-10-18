@@ -15,9 +15,11 @@ ride alongside a video signal. It targets MCC v2.0 as its primary
 output container, since FFmpeg natively demuxes MCC and muxes the
 payload into SEI for any modern video codec without feature loss.
 
-The project deliberately stops at the `cc_data()` boundary. NAL unit
-framing, codec-specific SEI injection, and container muxing are
-FFmpeg's job. See [ffmpeg-mcc-ingest.md](ffmpeg-mcc-ingest.md) for
+The encoder core stops at the `cc_data()` boundary; the MCC formatter
+adds only the ancillary-data framing an MCC line requires (a SMPTE
+334-2 Caption Distribution Packet inside a SMPTE 291M ANC packet, see
+Output formats). NAL unit framing, codec-specific SEI injection, and
+container muxing are FFmpeg's job. See [ffmpeg-mcc-ingest.md](ffmpeg-mcc-ingest.md) for
 how the two pieces connect.
 
 ## Tools and infrastructure
@@ -213,12 +215,28 @@ stream:
 - **`mcc`** (default). MacCaption v2.0 sidecar. Plain ASCII header
   declaring `File Format=MacCaption_MCC V2.0` and `Time Code Rate=`,
   followed by one `<timecode><tab><hex-payload>` line per video
-  frame. FFmpeg natively demuxes this and muxes the payload into
-  whatever ancillary location the target codec expects. v1 emits
-  uncompressed hex; the MCC dictionary substitution scheme is a size
-  optimization, not a correctness one.
+  frame. The payload is not bare `cc_data()`: it is the VANC packet
+  as it would ride in the blanking interval, so each frame's tuples
+  are wrapped as
+
+  ```
+  DID 61  SDID 01  DC                    SMPTE 291M ANC header
+  96 69  cdp_length  frame_rate  flags  seq(2)     CDP header
+  72  E0|cc_count  <cc_data tuples>                ccdata_section
+  74  seq(2)  packet_checksum                      CDP footer
+  <trailing ANC checksum byte>
+  ```
+
+  `cdp_length` and the ANC data count both cover the CDP through
+  `packet_checksum`, which makes the CDP sum to zero. FFmpeg's demuxer
+  drops the final byte of each line before parsing and then requires
+  `DID 0x61 / SDID 0x01`; a bare `cc_data()` line is silently ignored.
+  `formatMcc` rejects a frame that is not a whole number of 3-byte
+  tuples or carries more than the 31 tuples the 5-bit `cc_count` can
+  express. v1 emits uncompressed hex; the MCC dictionary substitution
+  scheme is a size optimization, not a correctness one.
 - **`raw`**. A flat binary dump of the per-frame `cc_data()` tuples
-  concatenated. Primarily for testing or piping into other parsers.
+  concatenated, with no CDP or ANC framing. Primarily for testing or piping into other parsers.
 
 For the FFmpeg side of the pipeline (which time-code-rate strings are
 accepted, what `eia608_extract` does, why the MCC choice was made
