@@ -87,6 +87,8 @@ src/
     window.ts                 DefineWindow / SetWindowAttributes / DSW...
     pen.ts                    SetPenAttributes / SetPenColor / SPL / DLY...
     text.ts                   G0 / G1 / G2 string encoder + C0 codes
+    styles.ts                 predefined window / pen style presets
+                              (Tables 26 / 27)
 
   timeline.ts                 declarative API: CaptionTimeline,
                               CaptionEvent, Window, Pen

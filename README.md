@@ -66,12 +66,14 @@ runtime dependency (`commander`).
   type, print and scroll direction, justify, display effect (snap,
   fade, wipe), effect direction, effect speed, and the seven
   predefined window / pen style presets (0..7).
-- The timeline and JSON `compile` paths emit these per cue:
-  `SetWindowAttributes` is sent when a window sets any attribute and
-  `SetPenColor` when an event's pen sets any color, after
-  `SetCurrentWindow`. Fields left unset default to predefined window
-  style 1 and pen style 1 (CTA-708-E section 8.11), so the emitted
-  command changes only what the caller set.
+- The timeline and JSON `compile` paths emit these per cue, after
+  `SetCurrentWindow`: `SetWindowAttributes` when a window sets any
+  attribute, `SetPenAttributes` / `SetPenColor` when an event's pen sets
+  any of their fields. Fields left unset default to the window's own
+  predefined window / pen style (CTA-708-E Tables 26 / 27), so the
+  emitted command changes only what the caller set. When one cue
+  changes the pen, the next cue in that window restores the style's
+  pen, so a cue's pen never leaks into the next.
 - All C1 captioning commands: CW0..CW7, CLW, DSW, HDW, TGW, DLW, DLY,
   DLC, RST, SPA, SPC, SPL, SWA, DF0..DF7.
 - All C0 control codes used by the encoder: NUL, ETX, BS, FF, CR,

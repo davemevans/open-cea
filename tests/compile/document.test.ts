@@ -142,4 +142,27 @@ describe('validateCompileDocument', () => {
       tracks: [{ target: '708', windows: [{ id: 0, relativePositioning: 'yes' }], events: [] }],
     })).toThrow(/relativePositioning: expected a boolean/);
   });
+
+  it('limits anchors to 0..74 / 0..209 when absolute and 0..99 when relative', () => {
+    const win = (w: Record<string, unknown>) => () => validateCompileDocument({
+      tracks: [{ target: '708', windows: [{ id: 0, ...w }], events: [] }],
+    });
+    expect(win({ anchorVertical: 75 })).toThrow(/anchorVertical: expected an integer in \[0, 74\]/);
+    expect(win({ anchorVertical: 74, anchorHorizontal: 209 })).not.toThrow();
+    expect(win({ relativePositioning: true, anchorHorizontal: 100 }))
+      .toThrow(/anchorHorizontal: expected an integer in \[0, 99\]/);
+    expect(win({ relativePositioning: true, anchorVertical: 99, anchorHorizontal: 99 })).not.toThrow();
+  });
+
+  it('rejects the undefined text tags 12..14', () => {
+    for (const textTag of [12, 13, 14]) {
+      expect(() => validateCompileDocument({
+        tracks: [{
+          target: '708',
+          windows: [{ id: 0 }],
+          events: [{ startTimeSec: 0, text: 'Hi', pen: { textTag } }],
+        }],
+      })).toThrow(/textTag: tags 12\.\.14 are undefined/);
+    }
+  });
 });

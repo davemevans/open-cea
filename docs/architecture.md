@@ -185,22 +185,33 @@ it) renders each event as this run of commands in one service block:
    flag.
 2. `SetCurrentWindow`.
 3. `SetWindowAttributes` — only when the window sets a fill, border,
-   direction, justify or effect field. Unset fields default to
-   predefined window style 1.
-4. `SetPenAttributes` — when the event carries a pen; includes the
-   text tag.
-5. `SetPenColor` — only when the pen sets a foreground / background /
-   edge color or opacity. Unset fields default to pen style 1.
+   direction, justify or effect field.
+4. `SetPenAttributes` — when the event's pen sets size, offset, text
+   tag, font, edge type, underline or italics, or when the window's
+   pen attributes differ from what this event needs.
+5. `SetPenColor` — likewise, for the foreground / background / edge
+   color and opacity fields.
 6. `SetPenLocation` — when the event pins a row and column.
 7. the text, then `DisplayWindows`.
 
 `SetWindowAttributes`, `SetPenAttributes` and `SetPenColor` all act on
 the current window (CTA-708-E sections 8.10.5.8 / 8.10.5.9 /
-8.10.5.10), so they follow `SetCurrentWindow`; `DefineWindow` preloads
-a window / pen style (section 8.10.5.2) that those commands then
-override. `SetWindowAttributes` and `SetPenColor` are emitted only when
-a caller sets one of their fields, so a timeline that uses neither
-produces the same bytes as before they were wired in.
+8.10.5.10), so they follow `SetCurrentWindow`. Each sets all of its
+fields at once, so unset fields are filled from the preset that
+`DefineWindow` loaded for the window's `windowStyleId` / `penStyleId`
+(section 8.10.5.2, Tables 26 / 27, in `cea708/styles.ts`; style ID 0
+means style 1 on creation). Filling them from style 1 regardless of
+the chosen style would silently undo the preset, for example turning
+window style 2's transparent fill solid black.
+
+Pen state outlives a cue: the per-cue `DefineWindow` is identical to
+the previous one, so the decoder treats it as a no-op and keeps the
+previous cue's pen. The compiler therefore tracks, per window, the
+`SetPenAttributes` / `SetPenColor` bytes the decoder holds, and
+re-emits the style's pen when a cue needs it back. A pen field a cue
+does set is sent on every such cue, even if unchanged, so a viewer who
+tunes in mid-stream picks it up. A timeline that sets no window
+attributes and no pen produces none of these commands.
 
 ## Roll-up row count (RU2 / RU3 / RU4)
 

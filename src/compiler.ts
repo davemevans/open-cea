@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-import { CaptionTimeline, type CaptionEvent, type Pen, type Window } from './timeline.js';
+import { CaptionTimeline, type CaptionEvent } from './timeline.js';
 import type { FrameRate } from './encoder.js';
 import { runOrchestrator, type Action } from './orchestrator.js';
 import { encodeServiceBlock } from './cea708/service.js';
@@ -25,56 +25,40 @@ import {
 } from './cea708/window.js';
 import { setPenAttributes, setPenColor, setPenLocation } from './cea708/pen.js';
 import { encodeString708 } from './cea708/text.js';
-import {
-  BorderType,
-  DisplayEffect,
-  Direction,
-  Justify,
-  Opacity,
-} from './cea708/types.js';
+import { penStylePreset, windowStylePreset } from './cea708/styles.js';
 
-// Presets loaded by DefineWindow's default windowStyleId=1 / penStyleId=1
-// (CTA-708-E section 8.11, Tables 26 and 27). SetWindowAttributes and
-// SetPenColor set every field at once, so when a caller sets only some
-// of them we fill the rest from these presets. That keeps the emitted
-// command consistent with the style DefineWindow already preloaded, so
-// only the fields the caller actually set change.
-const WINDOW_STYLE_1_DEFAULTS = {
-  fillColor: { r: 0, g: 0, b: 0 },
-  fillOpacity: Opacity.Solid,
-  borderColor: { r: 0, g: 0, b: 0 },
-  borderType: BorderType.None,
-  printDirection: Direction.LeftToRight,
-  scrollDirection: Direction.BottomToTop,
-  justify: Justify.Left,
-  effectDirection: Direction.LeftToRight,
-  effectSpeed: 1,
-  displayEffect: DisplayEffect.Snap,
-} as const;
-
-const PEN_STYLE_1_DEFAULTS = {
-  foregroundColor: { r: 2, g: 2, b: 2 },
-  foregroundOpacity: Opacity.Solid,
-  backgroundColor: { r: 0, g: 0, b: 0 },
-  backgroundOpacity: Opacity.Solid,
-  edgeColor: { r: 0, g: 0, b: 0 },
-} as const;
-
-/** True when the window sets any SetWindowAttributes field. */
-function hasWindowAttributes(w: Window): boolean {
-  return w.fillColor !== undefined || w.fillOpacity !== undefined ||
-    w.borderColor !== undefined || w.borderType !== undefined ||
-    w.printDirection !== undefined || w.scrollDirection !== undefined ||
-    w.justify !== undefined || w.effectDirection !== undefined ||
-    w.effectSpeed !== undefined || w.displayEffect !== undefined;
+/**
+ * `preset` with every field `fields` defines laid over it, plus whether
+ * any field was defined. SetWindowAttributes / SetPenAttributes /
+ * SetPenColor set all of their fields at once, so a caller that sets
+ * only some of them gets the rest from the style DefineWindow preloaded
+ * (CTA-708-E section 8.10.5.2) and only the fields it set change.
+ */
+function overlay<T extends object>(preset: T, fields: Partial<T>): { value: T; set: boolean } {
+  const value = { ...preset };
+  let set = false;
+  for (const key of Object.keys(preset) as (keyof T)[]) {
+    const v = fields[key];
+    if (v !== undefined) {
+      value[key] = v;
+      set = true;
+    }
+  }
+  return { value, set };
 }
 
-/** True when the pen sets any SetPenColor field. */
-function hasPenColor(p: Pen): boolean {
-  return p.foregroundColor !== undefined || p.foregroundOpacity !== undefined ||
-    p.backgroundColor !== undefined || p.backgroundOpacity !== undefined ||
-    p.edgeColor !== undefined;
+function sameBytes(a: Uint8Array, b: Uint8Array): boolean {
+  return a.length === b.length && a.every((v, i) => v === b[i]);
 }
+
+/**
+ * The SetPenAttributes / SetPenColor bytes whose effect the decoder's
+ * window currently holds, keyed by window ID. Pen state survives the
+ * per-event DefineWindow, which is a no-op when its parameters are
+ * unchanged (CTA-708-E section 8.10.5.2), so the compiler must track
+ * it to undo one event's pen before the next event.
+ */
+type PenState = Map<number, { spa: Uint8Array; spc: Uint8Array }>;
 
 export interface CompilerOptions {
   fps: FrameRate;
@@ -97,18 +81,20 @@ function concatChunks(chunks: Uint8Array[]): Uint8Array {
  * Build the byte stream that renders a single event's text in its window.
  *
  * The emitted command order is DefineWindow, SetCurrentWindow, then
- * (when the caller set the relevant fields) SetWindowAttributes,
- * SetPenAttributes, SetPenColor, then SetPenLocation, the text, and
- * DisplayWindows. SetWindowAttributes / SetPenAttributes / SetPenColor
- * all act on the current window (CTA-708-E sections 8.10.5.8 /
- * 8.10.5.9 / 8.10.5.10), so they must follow SetCurrentWindow;
- * DefineWindow makes the window current and preloads a window/pen
- * style, which those commands then override (section 8.10.5.2).
+ * (when needed) SetWindowAttributes, SetPenAttributes, SetPenColor,
+ * then SetPenLocation, the text, and DisplayWindows.
+ * SetWindowAttributes / SetPenAttributes / SetPenColor all act on the
+ * current window (CTA-708-E sections 8.10.5.8 / 8.10.5.9 / 8.10.5.10),
+ * so they must follow SetCurrentWindow; DefineWindow makes the window
+ * current and preloads a window/pen style, which those commands then
+ * override (section 8.10.5.2).
  *
- * SetWindowAttributes and SetPenColor are emitted only when the window
- * or pen actually sets one of their fields, so a timeline that sets
- * none of them produces the same bytes as before those commands were
- * wired up.
+ * Unset fields default to the window's own window / pen style preset
+ * (Tables 26 / 27), not to style 1. SetWindowAttributes is emitted when
+ * the window sets one of its fields. SetPenAttributes / SetPenColor are
+ * emitted when the event's pen sets one of their fields, or when an
+ * earlier event left the window's pen different from what this event
+ * needs; `penState` tracks that across events.
  *
  * Note: this path defines a visible window and writes into it, which
  * renders as paint-on. True pop-on per CTA-708-E section 9.3 uses two
@@ -121,6 +107,7 @@ function concatChunks(chunks: Uint8Array[]): Uint8Array {
 function buildRenderPayload(
   event: CaptionEvent,
   timeline: CaptionTimeline,
+  penState: PenState,
 ): Uint8Array {
   const chunks: Uint8Array[] = [];
   const winId = event.windowId ?? 0;
@@ -152,44 +139,32 @@ function buildRenderPayload(
 
   chunks.push(setCurrentWindow(winId));
 
-  if (hasWindowAttributes(winDef)) {
-    const d = WINDOW_STYLE_1_DEFAULTS;
-    chunks.push(setWindowAttributes({
-      fillColor: winDef.fillColor ?? d.fillColor,
-      fillOpacity: winDef.fillOpacity ?? d.fillOpacity,
-      borderColor: winDef.borderColor ?? d.borderColor,
-      borderType: winDef.borderType ?? d.borderType,
-      printDirection: winDef.printDirection ?? d.printDirection,
-      scrollDirection: winDef.scrollDirection ?? d.scrollDirection,
-      justify: winDef.justify ?? d.justify,
-      effectDirection: winDef.effectDirection ?? d.effectDirection,
-      effectSpeed: winDef.effectSpeed ?? d.effectSpeed,
-      displayEffect: winDef.displayEffect ?? d.displayEffect,
-    }));
+  const windowAttrs = overlay(windowStylePreset(winDef.windowStyleId ?? 1), winDef);
+  if (windowAttrs.set) {
+    chunks.push(setWindowAttributes(windowAttrs.value));
   }
 
-  if (event.pen) {
-    chunks.push(setPenAttributes({
-      penSize: event.pen.size ?? 1,    // Standard
-      offset: event.pen.offset ?? 1,   // Normal
-      textTag: event.pen.textTag ?? 0, // Dialog
-      fontStyle: event.pen.fontStyle ?? 0,
-      edgeType: event.pen.edgeType ?? 0,
-      underline: event.pen.underline ?? false,
-      italics: event.pen.italics ?? false,
-    }));
-
-    if (hasPenColor(event.pen)) {
-      const d = PEN_STYLE_1_DEFAULTS;
-      chunks.push(setPenColor({
-        foregroundColor: event.pen.foregroundColor ?? d.foregroundColor,
-        foregroundOpacity: event.pen.foregroundOpacity ?? d.foregroundOpacity,
-        backgroundColor: event.pen.backgroundColor ?? d.backgroundColor,
-        backgroundOpacity: event.pen.backgroundOpacity ?? d.backgroundOpacity,
-        edgeColor: event.pen.edgeColor ?? d.edgeColor,
-      }));
-    }
-  }
+  const penStyle = penStylePreset(winDef.penStyleId ?? 1);
+  const pen = event.pen ?? {};
+  const penAttrs = overlay(penStyle.attributes, {
+    penSize: pen.size,
+    offset: pen.offset,
+    textTag: pen.textTag,
+    fontStyle: pen.fontStyle,
+    edgeType: pen.edgeType,
+    underline: pen.underline,
+    italics: pen.italics,
+  });
+  const penColor = overlay(penStyle.color, pen);
+  const spa = setPenAttributes(penAttrs.value);
+  const spc = setPenColor(penColor.value);
+  const held = penState.get(winId) ?? {
+    spa: setPenAttributes(penStyle.attributes),
+    spc: setPenColor(penStyle.color),
+  };
+  if (penAttrs.set || !sameBytes(spa, held.spa)) chunks.push(spa);
+  if (penColor.set || !sameBytes(spc, held.spc)) chunks.push(spc);
+  penState.set(winId, { spa, spc });
 
   if (event.row !== undefined && event.column !== undefined) {
     chunks.push(setPenLocation(event.row, event.column));
@@ -240,12 +215,15 @@ export function buildTimelineActions708(
 ): Action[] {
   const serviceNumber = options.serviceNumber ?? 1;
   const actions: Action[] = [];
+  // getEvents() is in start-time order, the order the decoder sees
+  // them, which is what the pen-state tracking relies on.
   const events = timeline.getEvents();
+  const penState: PenState = new Map();
   for (const event of events) {
     actions.push({
       kind: '708',
       timeSec: event.startTimeSec,
-      payload: buildCcpPayload(buildRenderPayload(event, timeline), serviceNumber),
+      payload: buildCcpPayload(buildRenderPayload(event, timeline, penState), serviceNumber),
     });
     if (event.endTimeSec !== undefined) {
       const winId = event.windowId ?? 0;
