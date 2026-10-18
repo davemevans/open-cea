@@ -14,26 +14,24 @@
 
 // MCC (MacCaption) v2.0 sidecar formatter.
 //
-// MCC is a plain-text container indexed by SMPTE timecode. Crucially,
-// each data line is NOT the bare cc_data() payload: it is the full
-// Video Ancillary (VANC) data packet as it would ride in the vertical
-// blanking, i.e. a SMPTE 291M ancillary packet (DID/SDID/data-count)
-// whose user-data words are a SMPTE 334-2 / CEA-708 Caption
-// Distribution Packet (CDP). The cc_data() tuples live inside the
-// CDP's ccdata_section. ffmpeg's demuxer (specs/mccdec.c) parses each
-// line via av_smpte_291m_anc_8bit_decode + ..._extract_cta_708, so a
-// line that is only raw cc_data (DID would read as 0xF8) is rejected
-// as "not a closed captions packet" and silently produces no output.
+// MCC is a plain-text container indexed by SMPTE timecode. Each data
+// line is not the bare cc_data() payload but the vertical ancillary
+// (VANC) packet that would carry it: a type 2 ANC packet with DID 0x61
+// / SDID 0x01 (SMPTE ST 334-1 section 5.1, Table 1) whose user data
+// words are a Caption Distribution Packet (CDP, SMPTE ST 334-2). The
+// cc_data() tuples ride in the CDP's ccdata_section. ffmpeg's demuxer
+// (specs/mccdec.c) decodes each line as an ANC packet and extracts the
+// CDP, so a line holding only raw cc_data (first byte 0xF8 read as the
+// DID) is ignored as "not a closed captions packet".
 //
-// Per-line byte layout (uncompressed):
-//   DID(0x61) SDID(0x01) DC          <- SMPTE 334-1 ANC header
-//   96 69 len fr flags seq(2)        <- CDP header
-//   72 (0xE0|cc_count) <tuples...>   <- ccdata_section
-//   74 seq(2) packet_checksum        <- CDP footer (checksum zeroes the CDP)
-//   anc_checksum                     <- trailing SMPTE 291M checksum
-// ffmpeg strips the final trailing byte before parsing ("not included
-// in 8-bit sample encodings"), so DC == cdp_length == the CDP byte
-// count and the ANC checksum byte is required padding for that strip.
+// Per-line byte layout (uncompressed), see specs/334-2.md:
+//   61 01 DC                          ANC DID / SDID / data count
+//   96 69 len fr flags seq(2)         cdp_header (334-2 section 5.2)
+//   72 (E0|cc_count) <tuples...>      ccdata_section (section 5.4)
+//   74 seq(2) packet_checksum         cdp_footer (section 5.6)
+//   <trailing byte>                   see wrapAncPacket
+// DC counts the user data words (334-1 section 5.1), i.e. the CDP, so
+// DC == cdp_length.
 //
 // Header lines (confirmed against specs/mccdec.c):
 //   - "File Format=MacCaption_MCC V2.0"
@@ -46,10 +44,11 @@
 // nibbles and only G-Z as aliases).
 
 import { writeFileSync } from 'node:fs';
-import type { FrameRate } from '../encoder.js';
+import { ccCountPerFrame, type FrameRate } from '../encoder.js';
 import { frameToTimecode, mccTimeCodeRate } from './timecode.js';
 
-// CEA-708-E cdp_frame_rate codes (4-bit), packed as (code << 4) | 0x0F.
+// cdp_frame_rate codes, SMPTE ST 334-2 section 5.2, Table 3. The CDP
+// carries the code in the high nibble over a reserved '1111'.
 function cdpFrameRateCode(fps: FrameRate): number {
   switch (fps) {
     case 24:    return 0x2;
@@ -62,27 +61,24 @@ function cdpFrameRateCode(fps: FrameRate): number {
   }
 }
 
-// True when a frame carries at least one *valid* DTVCC tuple, i.e. a
-// cc_data() word with cc_valid=1 and cc_type of dtvcc_packet_data (2)
-// or dtvcc_packet_start (3). cc_type/cc_valid live in the low bits of
-// each tuple's first byte: 111(marker) v(valid) tt(type).
-function frameHasDtvcc(ccData: Uint8Array): boolean {
+// True when a frame carries at least one tuple with cc_valid=1, of
+// either CEA-608 (cc_type 00 / 01) or DTVCC (10 / 11) data. The first
+// byte of each tuple is marker(11111) cc_valid cc_type(2). Empty 608
+// slots and DTVCC padding both have cc_valid=0, so a stream of nothing
+// but those carries no caption service.
+function frameHasCaptionData(ccData: Uint8Array): boolean {
   for (let t = 0; t + 3 <= ccData.length; t += 3) {
-    const b0 = ccData[t];
-    const valid = (b0 >> 2) & 0x01;
-    const type = b0 & 0x03;
-    if (valid && type >= 2) return true;
+    if ((ccData[t] & 0x04) !== 0) return true;
   }
   return false;
 }
 
-// Wrap one frame's cc_data() tuples in a CDP + SMPTE 291M ANC packet.
+// Wrap one frame's cc_data() tuples in a CDP + ANC packet.
 // `seq` is the CDP sequence counter (header and footer must match).
-// `serviceActive` drives the CDP caption_service_active flag; it is a
-// stream-level decision (see formatMcc) rather than a per-frame one,
-// because DTVCC packets are interleaved with padding frames and the
-// flag describes whether a 708 service is running, not whether this
-// particular CDP happens to carry a service block.
+// `serviceActive` drives caption_service_active, which SMPTE ST 334-2
+// section 5.2 defines per CDP *stream* ("the CDP stream is conveying an
+// active caption service"), so it is decided once for the whole output
+// (see formatMcc) rather than per frame.
 function wrapAncPacket(
   ccData: Uint8Array,
   fps: FrameRate,
@@ -94,42 +90,48 @@ function wrapAncPacket(
   const seqHi = (seq >> 8) & 0xFF;
   const seqLo = seq & 0xFF;
 
-  // cdp_flags: ccdata_present (bit6) + reserved (bit0, always 1), plus
-  // caption_service_active (bit1) only when the stream carries 708.
+  // cdp_flags (section 5.2, Table 2), MSB first: time_code_present 0,
+  // ccdata_present 1, svcinfo_present 0, svc_info_start / change /
+  // complete 0 (no ccsvcinfo_section), caption_service_active, then
+  // the reserved bit, which is '1'.
   const flags = 0x40 | (serviceActive ? 0x02 : 0x00) | 0x01;
 
-  // cdp_length counts every CDP byte through packet_checksum:
-  //   header 7 + ccdata_section (2 + 3*ccCount) + footer 4
+  // cdp_length counts every CDP byte, cdp_identifier through
+  // packet_checksum: header 7 + ccdata_section (2 + 3*ccCount) +
+  // footer 4.
   const cdpLen = 7 + 2 + ccData.length + 4;
 
   const cdp = new Uint8Array(cdpLen);
   let i = 0;
   cdp[i++] = 0x96; cdp[i++] = 0x69;      // cdp_identifier
-  cdp[i++] = cdpLen & 0xFF;              // cdp_length
+  cdp[i++] = cdpLen;                     // cdp_length
   cdp[i++] = frByte;                     // cdp_frame_rate | reserved
   cdp[i++] = flags;                      // cdp_flags
-  cdp[i++] = seqHi; cdp[i++] = seqLo;    // cdp_hdr_sequence_counter
+  cdp[i++] = seqHi; cdp[i++] = seqLo;    // cdp_hdr_sequence_cntr
   cdp[i++] = 0x72;                       // ccdata_id
   cdp[i++] = 0xE0 | ccCount;             // marker(111) + cc_count
   cdp.set(ccData, i); i += ccData.length;
   cdp[i++] = 0x74;                       // cdp_footer_id
-  cdp[i++] = seqHi; cdp[i++] = seqLo;    // cdp_ftr_sequence_counter
+  cdp[i++] = seqHi; cdp[i++] = seqLo;    // cdp_ftr_sequence_cntr
   // packet_checksum makes the sum of all CDP bytes 0 (mod 256).
   let cdpSum = 0;
   for (let j = 0; j < cdpLen - 1; j++) cdpSum = (cdpSum + cdp[j]) & 0xFF;
   cdp[i] = (256 - cdpSum) & 0xFF;
 
-  // SMPTE 334-1 ANC header + trailing SMPTE 291M checksum. ffmpeg drops
-  // the trailing byte before parsing, so its value is advisory; we
-  // still emit a real low-8-bits checksum for other consumers.
+  // The ANC checksum (SMPTE ST 291-1) is a 9-bit sum over 10-bit words
+  // whose parity bits an 8-bit MCC line cannot carry, and 8-bit ST 436
+  // sample coding excludes it. MCC lines nonetheless end with one byte
+  // in that position, which ffmpeg strips unread before decoding the
+  // packet. It is filler: we write the 8-bit sum of the preceding bytes,
+  // which no reader checks; it is not a valid ST 291-1 checksum.
   const out = new Uint8Array(3 + cdpLen + 1);
-  out[0] = 0x61;          // DID  (CEA-708)
-  out[1] = 0x01;          // SDID
-  out[2] = cdpLen & 0xFF; // data_count == cdp_length
+  out[0] = 0x61;    // DID: closed captioning (334-1 Table 1)
+  out[1] = 0x01;    // SDID: CEA-708 CDP
+  out[2] = cdpLen;  // DC: number of user data words == cdp_length
   out.set(cdp, 3);
-  let ancSum = 0;
-  for (let j = 0; j < 3 + cdpLen; j++) ancSum = (ancSum + out[j]) & 0xFF;
-  out[3 + cdpLen] = ancSum;
+  let fill = 0;
+  for (let j = 0; j < 3 + cdpLen; j++) fill = (fill + out[j]) & 0xFF;
+  out[3 + cdpLen] = fill;
   return out;
 }
 
@@ -198,25 +200,20 @@ export function formatMcc(frames: Uint8Array[], options: MccOptions): string {
   lines.push(`Creation Time=${creationTime}`);
   lines.push(`Time Code Rate=${mccTimeCodeRate(options.fps)}`);
   lines.push('');
-  // caption_service_active is a property of the whole stream: set it
-  // when any frame carries a valid DTVCC (708) tuple, so a 608-only
-  // stream reports 0 and a 708 stream reports 1 continuously rather
-  // than flickering across the padding frames between DTVCC packets.
-  const serviceActive = frames.some(frameHasDtvcc);
+  // caption_service_active describes the whole CDP stream: set it when
+  // any frame carries valid 608 or 708 data, so it holds steady across
+  // the padding frames between captions.
+  const serviceActive = frames.some(frameHasCaptionData);
 
+  // cc_count shall be the SMPTE ST 334-2 Table 3 value for the frame
+  // rate (section 5.4), which is the encoder's fixed per-frame count.
+  const ccCount = ccCountPerFrame(options.fps);
   for (let i = 0; i < frames.length; i++) {
-    // cc_count is a 5-bit field and must agree with cdp_length, so
-    // refuse anything that is not a whole number of tuples or does not
-    // fit, rather than emit a CDP whose count and length disagree.
     const len = frames[i].length;
-    if (len % 3 !== 0) {
+    if (len !== ccCount * 3) {
       throw new RangeError(
-        `Frame ${String(i)}: cc_data length ${String(len)} is not a whole number of 3-byte tuples`,
-      );
-    }
-    if (len / 3 > 31) {
-      throw new RangeError(
-        `Frame ${String(i)}: ${String(len / 3)} cc_data tuples exceed the 31 a CDP cc_count can carry`,
+        `Frame ${String(i)}: cc_data is ${String(len)} bytes; a ${String(options.fps)} fps CDP ` +
+          `carries exactly ${String(ccCount)} tuples (${String(ccCount * 3)} bytes)`,
       );
     }
     // Each frame's cc_data() is wrapped as a CDP inside a SMPTE 291M

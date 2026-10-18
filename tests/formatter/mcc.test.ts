@@ -28,6 +28,12 @@ function tinyFrame(byte: number, fps: 24 | 25 | 29.97 | 30 | 50 | 59.94 | 60): U
   return new Uint8Array(sizes[fps]).fill(byte);
 }
 
+// Bytes of the `index`-th data line of an MCC document.
+function lineBytes(out: string, index: number): Uint8Array {
+  const line = out.split('\n').filter((l) => l.includes('\t'))[index];
+  return hexToBytes(line.split('\t')[1]);
+}
+
 function hexToBytes(hex: string): Uint8Array {
   const out = new Uint8Array(hex.length / 2);
   for (let i = 0; i < out.length; i++) {
@@ -73,33 +79,32 @@ describe('formatMcc - data lines', () => {
     expect(dataLines.length).toBe(3);
   });
 
-  it('wraps the cc_data in a CDP inside a SMPTE 291M ANC packet', () => {
-    const frame = new Uint8Array([0xFC, 0x80, 0x80]); // one cc_data tuple
-    const out = formatMcc([frame], { fps: 30, ...FIXED_OPTIONS });
-    const hex = out.split('\n').find((l) => l.startsWith('00:00:00:00\t'))?.split('\t')[1] ?? '';
-    const b = hexToBytes(hex);
-    // ANC header: DID=0x61, SDID=0x01, data_count == cdp_length.
-    expect(b[0]).toBe(0x61);
-    expect(b[1]).toBe(0x01);
-    const cdpLen = b[2];
-    expect(b.length).toBe(3 + cdpLen + 1); // + trailing ANC checksum
-    // CDP header: identifier 0x9669, length, frame-rate code 5 (30 fps).
-    expect(b[3]).toBe(0x96);
-    expect(b[4]).toBe(0x69);
-    expect(b[5]).toBe(cdpLen);
-    expect(b[6]).toBe((0x5 << 4) | 0x0F);
-    // ccdata_section: 0x72, then marker(111) + cc_count(1).
-    expect(b[10]).toBe(0x72);
-    expect(b[11]).toBe(0xE0 | 1);
-    expect([b[12], b[13], b[14]]).toEqual([0xFC, 0x80, 0x80]);
-    // CDP sums to zero (mod 256) via the footer packet_checksum.
-    let cdpSum = 0;
-    for (let i = 3; i < 3 + cdpLen; i++) cdpSum = (cdpSum + b[i]) & 0xFF;
-    expect(cdpSum).toBe(0);
+  it('wraps the cc_data in a CDP inside an ANC packet, byte for byte', () => {
+    // 60 fps: Table 3 cc_count 10. One valid field-1 608 tuple, an
+    // empty field-2 slot, then DTVCC padding.
+    const tuples = [0xFC, 0x94, 0x2C, 0xF9, 0x00, 0x00];
+    for (let i = 0; i < 8; i++) tuples.push(0xFA, 0x00, 0x00);
+    const out = formatMcc([new Uint8Array(tuples)], { fps: 60, ...FIXED_OPTIONS });
+    // Hand-packed from SMPTE ST 334-1 section 5.1 and ST 334-2 sections
+    // 5.2 / 5.4 / 5.6:
+    //   61 01 2B           DID, SDID, DC = 43 (the CDP length)
+    //   96 69 2B           cdp_identifier, cdp_length 43 = 7 + 2 + 30 + 4
+    //   8F                 frame rate code 8 (60) over reserved 1111
+    //   43                 ccdata_present | caption_service_active | reserved 1
+    //   00 00              cdp_hdr_sequence_cntr 0
+    //   72 EA              ccdata_id, 111 + cc_count 10
+    //   <30 tuple bytes>
+    //   74 00 00 AF        cdp_footer_id, footer counter 0, checksum
+    //                      (0x96 + ... + 0x00 + 0xAF = 0 mod 256)
+    //   8D                 trailing filler byte (8-bit sum of the rest)
+    expect(out).toContain(
+      '00:00:00:00\t61012B96692B8F43000072EAFC942CF90000' +
+        'FA0000FA0000FA0000FA0000FA0000FA0000FA0000FA0000740000AF8D\n',
+    );
   });
 
   it('uses ; separator for drop-frame rates', () => {
-    const out = formatMcc([new Uint8Array([0x00, 0x00, 0x00])], { fps: 29.97, ...FIXED_OPTIONS });
+    const out = formatMcc([tinyFrame(0xFA, 29.97)], { fps: 29.97, ...FIXED_OPTIONS });
     expect(out).toContain('00:00:00;00\t');
     expect(out.includes('00:00:00:00\t')).toBe(false);
   });
@@ -112,78 +117,91 @@ describe('formatMcc - data lines', () => {
     expect(out).toContain('00:00:00:02\t');
   });
 
-  it('round-trips the exact cc_data tuples through the CDP wrapper', () => {
-    // 30 fps -> 20 tuples * 3 = 60 cc_data bytes. Full line adds the
-    // 3-byte ANC header, 13 bytes of CDP framing, and 1 ANC checksum.
-    const frame = tinyFrame(0xFA, 30);
-    const out = formatMcc([frame], { fps: 30, ...FIXED_OPTIONS });
-    const hex = out.split('\n').find((l) => l.startsWith('00:00:00:00\t'))?.split('\t')[1] ?? '';
-    const b = hexToBytes(hex);
-    expect(b.length).toBe(3 + (13 + 60) + 1);
-    const cdpLen = b[2];
-    expect(cdpLen).toBe(13 + 60);
-    const ccCount = b[11] & 0x1F;
-    expect(ccCount).toBe(20);
-    const tuples = b.slice(12, 12 + 60);
-    expect(Array.from(tuples)).toEqual(Array.from(frame));
+  // SMPTE ST 334-2 section 5.2, Table 3: frame-rate code and cc_count.
+  it.each([
+    [24, 0x2, 25],
+    [25, 0x3, 24],
+    [29.97, 0x4, 20],
+    [30, 0x5, 20],
+    [50, 0x6, 12],
+    [59.94, 0x7, 10],
+    [60, 0x8, 10],
+  ] as const)('at %s fps writes frame-rate code %i and cc_count %i', (fps, code, ccCount) => {
+    const frame = tinyFrame(0xFA, fps);
+    const b = lineBytes(formatMcc([frame], { fps, ...FIXED_OPTIONS }), 0);
+    const cdpLen = 7 + 2 + 3 * ccCount + 4;
+    expect(b[2]).toBe(cdpLen);                    // DC
+    expect(b[5]).toBe(cdpLen);                    // cdp_length
+    expect(b[6]).toBe((code << 4) | 0x0F);        // cdp_frame_rate + reserved
+    expect(b[11]).toBe(0xE0 | ccCount);           // marker + cc_count
+    expect(Array.from(b.slice(12, 12 + 3 * ccCount))).toEqual(Array.from(frame));
+    expect(b.length).toBe(3 + cdpLen + 1);
+  });
+
+  it('increments the header and footer sequence counters together per CDP', () => {
+    const b1 = lineBytes(formatMcc([tinyFrame(0xFA, 60), tinyFrame(0xFA, 60)], { fps: 60, ...FIXED_OPTIONS }), 1);
+    // cdp_hdr_sequence_cntr at bytes 8..9; footer 74 + counter after the tuples.
+    expect([b1[8], b1[9]]).toEqual([0x00, 0x01]);
+    expect([b1[42], b1[43], b1[44]]).toEqual([0x74, 0x00, 0x01]);
+  });
+
+  it('wraps the sequence counter from 65535 to 0', () => {
+    const frames = Array.from({ length: 65537 }, () => tinyFrame(0xFA, 60));
+    const out = formatMcc(frames, { fps: 60, ...FIXED_OPTIONS });
+    const last = out.split('\n').filter((l) => l.includes('\t'));
+    const at = (i: number): number[] => Array.from(hexToBytes(last[i].split('\t')[1]).slice(8, 10));
+    expect(at(65535)).toEqual([0xFF, 0xFF]);
+    expect(at(65536)).toEqual([0x00, 0x00]);
   });
 });
 
-describe('formatMcc - cc_data guard', () => {
-  it('rejects a frame that is not a whole number of 3-byte tuples', () => {
-    expect(() => formatMcc([new Uint8Array(3), new Uint8Array(4)], { fps: 30, ...FIXED_OPTIONS }))
-      .toThrow(/Frame 1: cc_data length 4 is not a whole number of 3-byte tuples/);
-  });
-
-  it('rejects more tuples than the 5-bit cc_count can carry', () => {
-    expect(() => formatMcc([new Uint8Array(32 * 3)], { fps: 30, ...FIXED_OPTIONS }))
-      .toThrow(/32 cc_data tuples exceed the 31/);
-  });
-
-  it('accepts the 31-tuple maximum, encoding cc_count 31', () => {
-    const out = formatMcc([new Uint8Array(31 * 3).fill(0xFA)], { fps: 30, ...FIXED_OPTIONS });
-    const hex = out.split('\n').find((l) => l.startsWith('00:00:00:00\t'))?.split('\t')[1] ?? '';
-    // [DID SDID DC | 96 69 len fr flags seq seq | 72 cc_count ...]
-    expect(hexToBytes(hex)[11]).toBe(0xE0 | 31);
+describe('formatMcc - cc_count guard', () => {
+  it('rejects a frame whose tuple count differs from the frame-rate value', () => {
+    expect(() => formatMcc([tinyFrame(0xFA, 30), new Uint8Array(57)], { fps: 30, ...FIXED_OPTIONS }))
+      .toThrow(/Frame 1: cc_data is 57 bytes; a 30 fps CDP carries exactly 20 tuples \(60 bytes\)/);
+    expect(() => formatMcc([new Uint8Array(63)], { fps: 30, ...FIXED_OPTIONS })).toThrow(/exactly 20 tuples/);
+    expect(() => formatMcc([new Uint8Array(4)], { fps: 30, ...FIXED_OPTIONS })).toThrow(/exactly 20 tuples/);
   });
 });
 
 describe('formatMcc - caption_service_active flag', () => {
-  // cdp_flags is the 5th CDP byte: [DID SDID DC | 96 69 len fr FLAGS ...].
+  // [DID SDID DC | 96 69 len fr FLAGS ...]
   const FLAGS = 7;
-  const CSA = 0x02; // caption_service_active bit
-  // A 30 fps frame with one valid DTVCC start tuple (0xFF), rest padding.
+  const CSA = 0x02;
+  const paddingFrame = (): Uint8Array => tinyFrame(0xFA, 30); // cc_valid=0 everywhere
   const dtvccFrame = (): Uint8Array => {
-    const f = new Uint8Array(60).fill(0xFA); // dtvcc padding (cc_valid=0)
-    f[0] = 0xFF; f[1] = 0x02; f[2] = 0x21;   // dtvcc_packet_start, cc_valid=1
+    const f = paddingFrame();
+    f[0] = 0xFF; f[1] = 0x02; f[2] = 0x21; // dtvcc_packet_start, cc_valid=1
     return f;
   };
-  // A 30 fps frame carrying only a valid 608 tuple + padding (no DTVCC).
   const ntscOnlyFrame = (): Uint8Array => {
-    const f = new Uint8Array(60).fill(0xFA);
-    f[0] = 0xFC; f[1] = 0x80; f[2] = 0x80;   // ntsc field 1, cc_valid=1
+    const f = paddingFrame();
+    f[0] = 0xFC; f[1] = 0x94; f[2] = 0x2C; // 608 field 1, cc_valid=1
     return f;
   };
-  const flagsOf = (out: string, tc: string): number =>
-    hexToBytes(out.split('\n').find((l) => l.startsWith(`${tc}\t`))?.split('\t')[1] ?? '')[FLAGS];
+  const flagsOf = (out: string, i: number): number => lineBytes(out, i)[FLAGS];
 
   it('sets caption_service_active when the stream carries DTVCC', () => {
     const out = formatMcc([dtvccFrame()], { fps: 30, ...FIXED_OPTIONS });
-    expect(flagsOf(out, '00:00:00:00') & CSA).toBe(CSA);
+    expect(flagsOf(out, 0) & CSA).toBe(CSA);
   });
 
-  it('clears caption_service_active for a 608-only / DTVCC-free stream', () => {
-    const out = formatMcc([ntscOnlyFrame(), ntscOnlyFrame()], { fps: 30, ...FIXED_OPTIONS });
-    expect(flagsOf(out, '00:00:00:00') & CSA).toBe(0);
-    expect(flagsOf(out, '00:00:00:01') & CSA).toBe(0);
+  it('sets caption_service_active for a 608-only stream (608 is caption service 0)', () => {
+    const out = formatMcc([ntscOnlyFrame(), paddingFrame()], { fps: 30, ...FIXED_OPTIONS });
+    expect(flagsOf(out, 0) & CSA).toBe(CSA);
+    expect(flagsOf(out, 1) & CSA).toBe(CSA);
+  });
+
+  it('clears caption_service_active for a stream with no valid caption data', () => {
+    const out = formatMcc([paddingFrame(), paddingFrame()], { fps: 30, ...FIXED_OPTIONS });
+    expect(flagsOf(out, 0)).toBe(0x41);
+    expect(flagsOf(out, 1)).toBe(0x41);
   });
 
   it('holds the flag high on every frame (no flicker across padding frames)', () => {
-    // One DTVCC frame followed by a padding-only frame: the stream is
-    // "active", so both CDPs must report caption_service_active.
-    const out = formatMcc([dtvccFrame(), ntscOnlyFrame()], { fps: 30, ...FIXED_OPTIONS });
-    expect(flagsOf(out, '00:00:00:00') & CSA).toBe(CSA);
-    expect(flagsOf(out, '00:00:00:01') & CSA).toBe(CSA);
+    const out = formatMcc([dtvccFrame(), paddingFrame()], { fps: 30, ...FIXED_OPTIONS });
+    expect(flagsOf(out, 0)).toBe(0x43);
+    expect(flagsOf(out, 1)).toBe(0x43);
   });
 });
 
