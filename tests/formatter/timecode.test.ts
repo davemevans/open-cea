@@ -76,8 +76,12 @@ describe('frameToTimecode - drop-frame at 29.97 fps', () => {
   // start of every minute except every tenth minute.
   const fps = 29.97;
 
-  it('uses : separator before the frame field', () => {
-    expect(frameToTimecode(0, fps)).toBe('00:00:00:00');
+  it('uses : separator on a drop-frame-numbered label', () => {
+    // Frame 1800 carries the skipped-frame label, so this checks the
+    // separator on a timecode that is unambiguously drop-frame.
+    const tc = frameToTimecode(1800, fps);
+    expect(tc).toBe('00:01:00:02');
+    expect(tc.includes(';')).toBe(false);
   });
 
   it('does not skip at frame 0', () => {
@@ -88,7 +92,7 @@ describe('frameToTimecode - drop-frame at 29.97 fps', () => {
     // 60 actual seconds at 29.97 = 1800 actual frames. The 1-minute
     // timecode mark drops frame numbers 00 and 01, so frame index 1799
     // is the last 00:00:59 frame (29) and frame index 1800 jumps to
-    // 00:01:00;02.
+    // 00:01:00:02.
     expect(frameToTimecode(1798, fps)).toBe('00:00:59:28');
     expect(frameToTimecode(1799, fps)).toBe('00:00:59:29');
     expect(frameToTimecode(1800, fps)).toBe('00:01:00:02');
@@ -96,7 +100,7 @@ describe('frameToTimecode - drop-frame at 29.97 fps', () => {
 
   it('does not skip at the 10-minute boundary', () => {
     // 10 minutes of timecode contains 10 * 60 * 30 - 9 * 2 = 17982
-    // actual frames. Frame 17982 is timecode 00:10:00;00; no skip on
+    // actual frames. Frame 17982 is timecode 00:10:00:00; no skip on
     // multiples of 10 minutes.
     expect(frameToTimecode(17981, fps)).toBe('00:09:59:29');
     expect(frameToTimecode(17982, fps)).toBe('00:10:00:00');
@@ -108,13 +112,16 @@ describe('frameToTimecode - drop-frame at 29.97 fps', () => {
     // 1 hour of timecode = 107892 actual frames (107892 / 29.97 ~= 1h).
     expect(frameToTimecode(107892, fps)).toBe('01:00:00:00');
   });
+
 });
 
 describe('frameToTimecode - drop-frame at 59.94 fps', () => {
   const fps = 59.94;
 
-  it('uses : separator before the frame field', () => {
-    expect(frameToTimecode(0, fps)).toBe('00:00:00:00');
+  it('uses : separator on a drop-frame-numbered label', () => {
+    const tc = frameToTimecode(3600, fps);
+    expect(tc).toBe('00:01:00:04');
+    expect(tc.includes(';')).toBe(false);
   });
 
   it('skips frame numbers 00..03 at the 1-minute boundary', () => {
